@@ -37,6 +37,7 @@ class ModNote:
     instrument: int = -1  # -1 = no instrument (MOD 0); 0-30 = Furnace instrument
     effect: int = 0
     effect_arg: int = 0
+    xm_volume: int = -1   # XM volume column (0-64), -1 = not set
 
 
 class ModSong:
@@ -141,7 +142,7 @@ def parse_mod(file_path: str) -> ModSong:
         highest = max(song.orders[:song.song_length]) if song.orders else 0
         song.channels = 4 if highest < 64 else 8
 
-    print(f"Detected MOD: {magic} → {song.channels} channels")
+    print(f"Detected MOD: {magic} -> {song.channels} channels")
 
     num_patterns = max(song.orders[:song.song_length]) + 1 if song.orders else 0
 
@@ -182,7 +183,7 @@ def parse_mod(file_path: str) -> ModSong:
             sample.data = list(data[offset:offset + sample.length])
             offset += sample.length
 
-    print(f"Parsed MOD: '{song.name}' — {song.channels} channels, {num_patterns} patterns, {len(song.samples)} samples")
+    print(f"Parsed MOD: '{song.name}' -- {song.channels} channels, {num_patterns} patterns, {len(song.samples)} samples")
 
     # Scan first pattern row 0 for initial speed/BPM (effect 0x0F)
     if song.patterns and song.patterns[song.orders[0]]:

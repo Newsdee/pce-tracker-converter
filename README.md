@@ -1,6 +1,6 @@
-# MOD → Furnace Converter for PC Engine
+# MOD/XM → Furnace Converter for PC Engine
 
-Converts ProTracker `.mod` files into Furnace `.fur` tracker files targeting the **PC Engine / TurboGrafx-16** sound chip (HuC6280, 6 wavetable channels).
+Converts ProTracker `.mod` and FastTracker II `.xm` files into Furnace `.fur` tracker files targeting the **PC Engine / TurboGrafx-16** sound chip (HuC6280, 6 wavetable channels).
 
 ## Quick Start
 
@@ -8,18 +8,22 @@ Converts ProTracker `.mod` files into Furnace `.fur` tracker files targeting the
 python convert_mod.py Tinytune.mod              # outputs Tinytune.fur
 python convert_mod.py input.mod output.fur      # explicit output path
 python convert_mod.py input.mod --noise_insts=5,8  # force samples 5,8 to noise channels
+python convert_mod.py song.xm                   # auto-detects XM format
+python convert_mod.py song.xm --drop_channels=5,6 --noise_channel=4
 ```
 
 Requires Python 3.8+ and NumPy.
 
 ## What It Does
 
-1. **Parses** a 4/6/8-channel ProTracker MOD (M.K., 4CHN, 6CHN, 8CHN, FLT4, etc.)
-2. **Classifies** each sample as tonal, percussive, or noise
+1. **Parses** MOD (4/6/8-channel ProTracker) or XM (FastTracker II, any channel count) files
+2. **Classifies** each sample/instrument as tonal, percussive, or noise
 3. **Extracts** 32-sample 5-bit wavetables from sample data using single-cycle detection
-4. **Maps** MOD effects to Furnace effect IDs with persistent-effect re-emission
+4. **Maps** MOD/XM effects to Furnace effect IDs with persistent-effect re-emission
 5. **Compacts** instruments and wavetables (drops unused, deduplicates, detects canonical shapes)
 6. **Writes** a Furnace v232 `.fur` file compatible with Furnace 0.6.8.3
+
+For XM files, multi-sample instruments pick the most-used sub-sample, and XM volume envelopes are converted to PCE volume macros with sustain/loop/release mapping.
 
 ## Project Structure
 
@@ -29,6 +33,7 @@ convert_mod.bat         Windows batch runner
 
 lib/
   mod_parser.py         ProTracker MOD parser (samples, patterns, orders)
+  xm_parser.py          FastTracker II XM parser (instruments, envelopes, packed patterns)
   fur_writer.py         Furnace .fur writer (v232 INFO format, zlib compressed)
   sample_processor.py   Sample → wavetable conversion + instrument macros
   effect_mapper.py      MOD → Furnace effect ID mapping (reference; not used by persistence engine)
@@ -38,6 +43,10 @@ tools/
   dump_pattern.py       Inspect PATN blocks with effectMask decoding
   dump_wavetables.py    Inspect wavetable data from a MOD file
   verify_fur.py         Validate .fur file structure (block pointers, counts)
+
+examples/
+  TinyTune/             MOD example with convert.bat
+  LittleSwedishGirl/    XM example with convert.bat (9ch, --drop_channels demo)
 ```
 
 ## Technical Details
@@ -183,11 +192,48 @@ python tools/verify_fur.py Tinytune_new.fur
 
 ## Limitations
 
-- **6 channels max**: MOD files with more than 6 channels are truncated (PCE has 6 wavetable channels)
+- **6 channels max**: Files with more than 6 channels are truncated (PCE has 6 wavetable channels). Use `--drop_channels` to choose which channels to remove before truncation
 - **No PCM sample support**: Long samples are converted to single-cycle wavetables, not PCM. Original samples are exported to a `.zip` for reference
 - **Finetune ignored**: The MOD sample finetune field (sub-semitone tuning) is not yet mapped to Furnace detune
 - **Noise channel**: Noise-classified instruments are migrated to channels 5-6 (PCE noise channels) when possible, but polyphonic noise may be dropped. Use `--noise_insts` to manually tag instruments that should use noise mode
 - **Wavetable fidelity**: Complex multi-cycle waveforms lose harmonic richness when reduced to a single cycle. The original MOD samples are preserved in the exported `.zip` for manual refinement in Furnace
+- **XM multi-sample instruments**: Only the most-used sub-sample (by note mapping frequency) is kept per instrument. Other sub-samples are discarded
+- **XM volume column priority**: When both the volume column and effect column contain an effect, the effect column wins; the volume column effect is lost
+
+## XM-Specific Features
+
+### Format Auto-Detection
+
+The converter detects MOD vs XM by file extension (`.mod` / `.xm`). Both formats produce the same `ModSong` intermediate representation and flow through the same pipeline.
+
+### Channel Management
+
+XM files often have more than 6 channels. Two CLI options help fit the music into PCE's 6 channels:
+
+**`--drop_channels=N,M`** removes channels (1-based) before any other processing:
+```bash
+python convert_mod.py song.xm --drop_channels=5,6,7   # remove channels 5, 6, 7
+```
+
+**`--noise_channel=N[,M]`** swaps channel N into PCE noise slot (ch5), and optionally M into ch6:
+```bash
+python convert_mod.py song.xm --noise_channel=4       # ch4 <-> ch5
+python convert_mod.py song.xm --noise_channel=4,7     # ch4 <-> ch5, ch7 <-> ch6
+```
+
+Processing order: drop → swap → limit to 6 → conversion.
+
+### Variable Pattern Length
+
+XM patterns can have different row counts (1-256). The converter sets `rows_per_pattern` to the longest pattern in the file. MOD files always use 64 rows.
+
+### XM Volume Envelopes
+
+XM instruments can have multi-point volume envelopes with sustain and loop points. These are interpolated to per-frame PCE volume macros:
+
+- **Sustain point** → Furnace macro loop (holds until note-off)
+- **Envelope loop** → Furnace macro loop (repeats segment)
+- **Fadeout** → applied post-release (mapped to Furnace release envelope)
 
 ## Effect Mapping Reference
 

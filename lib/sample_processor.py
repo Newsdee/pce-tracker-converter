@@ -1,10 +1,10 @@
 # lib/sample_processor.py
-# MOD sample → PCE wavetable + instrument macro conversion
+# MOD sample -> PCE wavetable + instrument macro conversion
 #
 # Classification:
-#   tonal      — looped sample → extract one cycle from loop region, sustaining envelope
-#   percussive — unlooped or short → extract first 32 bytes, decaying envelope
-#   noise      — name/waveform suggests noise (hi-hat, snare buzz) → noise macro + decay
+#   tonal      -- looped sample -> extract one cycle from loop region, sustaining envelope
+#   percussive -- unlooped or short -> extract first 32 bytes, decaying envelope
+#   noise      -- name/waveform suggests noise (hi-hat, snare buzz) -> noise macro + decay
 
 import math
 import struct
@@ -14,7 +14,7 @@ import numpy as np
 from typing import List, Optional
 
 
-# ─── Classification ───
+# --- Classification ---
 
 NOISE_KEYWORDS = {"hat", "hh", "hihat", "hi-hat", "cymbal", "cym", "noise",
                   "rim", "shaker", "tamb", "cabasa", "marac"}
@@ -40,7 +40,7 @@ def classify_sample(sample) -> str:
     if sample.length < 512:
         return "percussive"
 
-    # Waveform analysis: high zero-crossing rate → noise-like
+    # Waveform analysis: high zero-crossing rate -> noise-like
     if len(sample.data) > 32:
         data = np.array(sample.data[:min(512, len(sample.data))],
                         dtype=np.uint8).astype(np.int16) - 128
@@ -53,7 +53,7 @@ def classify_sample(sample) -> str:
     return "percussive"
 
 
-# ─── Wavetable extraction ───
+# --- Wavetable extraction ---
 
 def _detect_fundamental_period(signal):
     """Detect fundamental period in a signal using normalized autocorrelation.
@@ -84,7 +84,7 @@ def _detect_fundamental_period(signal):
     if i >= n // 2:
         return n, 0.0
 
-    # Now we're ascending from valley — collect ALL local peaks
+    # Now we're ascending from valley -- collect ALL local peaks
     peaks = []
     j = i
     while j < n // 2:
@@ -166,23 +166,23 @@ def extract_wavetable(sample, target_size: int = 32) -> dict:
             ac_cycles = len(loop) / ac_period if ac_period > 0 else 1.0
 
             if ac_conf > 0.5 and ac_period >= 8:
-                # High confidence AC — trust it
+                # High confidence AC -- trust it
                 best_period = ac_period
                 confidence = ac_conf
             elif fft_period >= 8 and fft_cycles >= 1.4:
                 # FFT gives a reasonable result
                 if ac_conf > 0.3 and ac_period >= 8:
-                    # AC has some signal — check if they agree
+                    # AC has some signal -- check if they agree
                     ratio = ac_period / fft_period if fft_period > 0 else 999
                     if 0.7 < ratio < 1.3:
                         best_period = ac_period  # agree, use more precise AC
                         confidence = max(ac_conf, 0.5)
                     elif abs(round(ratio) - ratio) < 0.35 and round(ratio) >= 2:
-                        # AC found a harmonic (period is 1/Nth of FFT) — use FFT
+                        # AC found a harmonic (period is 1/Nth of FFT) -- use FFT
                         best_period = fft_period
                         confidence = 0.5
                     elif abs(1/ratio - round(1/ratio)) < 0.35 and round(1/ratio) >= 2:
-                        # AC found a subharmonic — use FFT
+                        # AC found a subharmonic -- use FFT
                         best_period = fft_period
                         confidence = 0.5
                     else:
@@ -281,7 +281,7 @@ def _extract_unlooped_cycle(raw: np.ndarray, info: dict) -> np.ndarray:
     ac_period, ac_conf = _detect_fundamental_period(filtered)
 
     if ac_conf < 0.4 or ac_period < 8:
-        # Low confidence — try FFT alone on filtered signal
+        # Low confidence -- try FFT alone on filtered signal
         fft_period, _ = _detect_period_fft(filtered)
         if fft_period >= 16 and len(filtered) / fft_period >= 1.4:
             ac_period = fft_period
@@ -300,7 +300,7 @@ def _extract_unlooped_cycle(raw: np.ndarray, info: dict) -> np.ndarray:
         if sub_period >= 4:
             sub_cycles_in_macro = len(macro_chunk) / sub_period
             if sub_cycles_in_macro >= 1.8:
-                # Multiple waveform cycles in the macro-period — extract one
+                # Multiple waveform cycles in the macro-period -- extract one
                 cycle = filtered[:int(round(sub_period))]
                 total_wf_cycles = len(raw) / sub_period
                 info["cycles_detected"] = total_wf_cycles
@@ -332,7 +332,7 @@ def _resample_and_quantize(data: np.ndarray, target_size: int = 32) -> List[int]
     return wavetable.tolist()
 
 
-# ─── Volume envelope generation ───
+# --- Volume envelope generation ---
 
 def make_volume_envelope(classification: str, pce_volume: int,
                          sample=None, max_note_rows: int = 0,
@@ -375,7 +375,7 @@ def make_volume_envelope(classification: str, pce_volume: int,
                     rms = np.sqrt(np.mean(chunk ** 2))
                     env.append(max(0, min(31, round(vol * rms / peak_rms))))
             # If raw envelope is mostly flat (sample has constant amplitude),
-            # apply an artificial logarithmic decay — the MOD retriggers
+            # apply an artificial logarithmic decay -- the MOD retriggers
             # the note frequently so it acts as a short hit, not a sustain.
             if len(env) >= 4 and min(env) > vol * 0.7:
                 env = _log_decay(vol, env_ticks)
@@ -421,7 +421,7 @@ def make_volume_envelope(classification: str, pce_volume: int,
                     "volume_release": 255,
                 }
             else:
-                # Short/no attack — just sustain
+                # Short/no attack -- just sustain
                 sustain_vol = max(0, min(31, round(vol * loop_rms / peak_rms)))
                 return {
                     "volume_env": [sustain_vol],
@@ -484,7 +484,81 @@ def _log_decay(vol: int, length: int) -> List[int]:
     return env
 
 
-# ─── Noise macro generation ───
+# --- XM envelope conversion ---
+
+def make_volume_envelope_from_xm(xm_env_points, vol, sustain_pt=-1,
+                                  loop_start=-1, loop_end=-1, fadeout=0):
+    """Convert XM volume envelope points to PCE volume macro.
+
+    xm_env_points: list of (frame, value) tuples. XM volume 0-64.
+    vol: base PCE volume (0-31).
+    sustain_pt: sustain point index (-1 = none).
+    loop_start/end: loop point indices (-1 = none).
+    fadeout: XM fadeout value (0-4095).
+
+    Returns dict with volume_env, volume_loop, volume_release.
+    """
+    if not xm_env_points or len(xm_env_points) < 2:
+        return {"volume_env": [vol], "volume_loop": 0, "volume_release": 255}
+
+    # Determine the frame range to interpolate
+    last_frame = xm_env_points[-1][0]
+    if last_frame == 0:
+        last_frame = 1
+
+    # Interpolate XM envelope to one value per frame
+    interp = []
+    for frame in range(last_frame + 1):
+        # Find surrounding points
+        prev_pt = xm_env_points[0]
+        next_pt = xm_env_points[-1]
+        for j in range(len(xm_env_points) - 1):
+            if xm_env_points[j][0] <= frame <= xm_env_points[j + 1][0]:
+                prev_pt = xm_env_points[j]
+                next_pt = xm_env_points[j + 1]
+                break
+        span = next_pt[0] - prev_pt[0]
+        if span > 0:
+            t = (frame - prev_pt[0]) / span
+            xm_vol = prev_pt[1] + t * (next_pt[1] - prev_pt[1])
+        else:
+            xm_vol = prev_pt[1]
+        # XM volume 0-64 -> PCE 0-31 scaled by instrument volume
+        pce_val = max(0, min(31, round(vol * xm_vol / 64.0)))
+        interp.append(pce_val)
+
+    if not interp:
+        interp = [vol]
+
+    # Determine loop and release points
+    volume_loop = 255
+    volume_release = 255
+
+    if sustain_pt >= 0 and sustain_pt < len(xm_env_points):
+        sustain_frame = xm_env_points[sustain_pt][0]
+        # Sustain = loop point in Furnace (note-off releases)
+        volume_loop = min(sustain_frame, len(interp) - 1)
+        volume_release = volume_loop
+    elif loop_start >= 0 and loop_end >= 0:
+        if loop_start < len(xm_env_points) and loop_end < len(xm_env_points):
+            volume_loop = min(xm_env_points[loop_start][0], len(interp) - 1)
+
+    # Trim envelope: if it's very long, cap at 128 frames
+    if len(interp) > 128:
+        interp = interp[:128]
+        if volume_loop != 255 and volume_loop >= 128:
+            volume_loop = 127
+        if volume_release != 255 and volume_release >= 128:
+            volume_release = 127
+
+    return {
+        "volume_env": interp,
+        "volume_loop": volume_loop,
+        "volume_release": volume_release,
+    }
+
+
+# --- Noise macro generation ---
 
 def make_noise_macro(classification: str) -> Optional[dict]:
     """Generate noise macro for noise-classified instruments."""
@@ -496,7 +570,7 @@ def make_noise_macro(classification: str) -> Optional[dict]:
     }
 
 
-# ─── WAV export ───
+# --- WAV export ---
 
 def export_samples_zip(samples, zip_path: str):
     """Export all MOD samples as individual .wav files in a zip archive."""
@@ -535,7 +609,7 @@ def _make_wav(data: np.ndarray, sample_rate: int = 8363) -> bytes:
     return buf.getvalue()
 
 
-# ─── Main entry point ───
+# --- Main entry point ---
 
 def process_samples_for_pce(samples, pce_volumes: List[int] = None,
                             max_note_rows: dict = None, speed: int = 6):
@@ -574,8 +648,20 @@ def process_samples_for_pce(samples, pce_volumes: List[int] = None,
 
         wt_info = extract_wavetable(sample)
         mnr = max_note_rows.get(i, 0)
-        vol_data = make_volume_envelope(classification, vol, sample,
-                                        max_note_rows=mnr, speed=speed)
+
+        # XM envelope path: if sample has XM volume envelope data, use it
+        xm_env = getattr(sample, 'xm_vol_env', None)
+        if xm_env:
+            vol_data = make_volume_envelope_from_xm(
+                xm_env, vol,
+                sustain_pt=getattr(sample, 'xm_vol_sustain', -1),
+                loop_start=getattr(sample, 'xm_vol_loop_start', -1),
+                loop_end=getattr(sample, 'xm_vol_loop_end', -1),
+                fadeout=getattr(sample, 'xm_vol_fadeout', 0),
+            )
+        else:
+            vol_data = make_volume_envelope(classification, vol, sample,
+                                            max_note_rows=mnr, speed=speed)
         noise = make_noise_macro(classification)
 
         results.append({

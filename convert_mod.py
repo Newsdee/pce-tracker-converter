@@ -1,6 +1,7 @@
 # convert_mod.py
-# MOD → Furnace .fur Converter for PC Engine (6 channels)
+# MOD/XM -> Furnace .fur Converter for PC Engine (6 channels)
 # Usage: python convert_mod.py input.mod [output.fur]
+#        python convert_mod.py input.xm  [output.fur] [--drop_channels=5,6] [--noise_channel=4]
 
 import sys
 import math
@@ -10,10 +11,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
 
 from mod_parser import parse_mod, ModSong, ModNote
+from xm_parser import parse_xm
 from sample_processor import process_samples_for_pce, export_samples_zip
 from fur_writer import FurWriter
 
-# ─── Effect persistence categories ───
+# --- Effect persistence categories ---
 # MOD effects persist until changed; Furnace effects are one-shot.
 # We track 5 categories and re-emit when state changes, matching
 # Furnace's MOD import logic (mod.cpp fxUsage / fxUsageTyp).
@@ -34,7 +36,7 @@ def mod_vol_to_pce(mod_vol: int) -> int:
     return max(0, min(31, round(31 + db / 1.5)))
 
 
-# ─── Canonical waveforms (32 samples, 5-bit 0-31) ───
+# --- Canonical waveforms (32 samples, 5-bit 0-31) ---
 
 def _make_canonical_waveforms():
     """Generate canonical PCE waveforms for matching and substitution."""
@@ -97,7 +99,7 @@ def _optimize_wavetables(sample_data, used_instruments):
         if canon and canon != "flat" and canon in CANONICAL_WAVEFORMS:
             wt = CANONICAL_WAVEFORMS[canon]
 
-        # Flat → single shared DC wavetable
+        # Flat -> single shared DC wavetable
         if canon == "flat":
             wt = [16] * 32
 
@@ -172,9 +174,9 @@ def _convert_oneshot_effects(effect, param):
         return [0x91 | (param << 8)]
     elif effect == 0x0B:   # Position jump
         return [0x0B | (param << 8)]
-    elif effect == 0x0C:   # Set volume → volume column (handled separately)
+    elif effect == 0x0C:   # Set volume -> volume column (handled separately)
         return []
-    elif effect == 0x0D:   # Pattern break, BCD→decimal
+    elif effect == 0x0D:   # Pattern break, BCD->decimal
         row = (param >> 4) * 10 + (param & 0x0F)
         return [0x0D | (row << 8)]
     elif effect == 0x0F:   # Speed / Tempo
@@ -245,7 +247,7 @@ def _apply_persistence(raw_rows, fx_usage, ins_default_vol=None):
                 # Memory recall for param=0 (slide/vib/trem only)
                 if val == 0:
                     if set_state[cat] < 0:
-                        continue   # never seen → skip (effectState stays 0)
+                        continue   # never seen -> skip (effectState stays 0)
                     val = set_state[cat]
             elif cat in (FX_CAT_VIB, FX_CAT_TREM):
                 if val == 0:
@@ -294,16 +296,22 @@ def _apply_persistence(raw_rows, fx_usage, ins_default_vol=None):
         if effect in (0x01, 0x02, 0x03, 0x05):
             last_slide_type = cur_slide_type
 
-        # Volume column — MOD vs Furnace semantics reconciliation.
+        # Volume column -- MOD vs Furnace semantics reconciliation.
         # MOD: note+instrument trigger always resets volume to sample default.
         #      Cxx on same row overrides that default.
         # Furnace: channel volume persists until explicitly set in volume column.
         # Strategy: track fur_chan_vol (what Furnace thinks the volume is).
         # When a note triggers and MOD's volume would differ, inject a restore.
         vol = -1
+        xm_vol = row.get("xm_volume", -1)
         if effect == 0x0C:
-            # Explicit volume set — applies in both MOD and Furnace
+            # Explicit volume set -- applies in both MOD and Furnace
             pce_vol = mod_vol_to_pce(param)
+            vol = pce_vol
+            fur_chan_vol = pce_vol
+        elif xm_vol >= 0:
+            # XM volume column was set alongside another effect (e.g. pitch slide)
+            pce_vol = mod_vol_to_pce(xm_vol)
             vol = pce_vol
             fur_chan_vol = pce_vol
         elif has_note:
@@ -320,7 +328,7 @@ def _apply_persistence(raw_rows, fx_usage, ins_default_vol=None):
         if row["instrument"] >= 0:
             last_ins = row["instrument"]
 
-        # Vol slide and fine vol effects make channel vol unpredictable —
+        # Vol slide and fine vol effects make channel vol unpredictable --
         # mark as unknown so the next note trigger injects a restore.
         if cur_state[FX_CAT_VSLIDE] != 0:
             fur_chan_vol = -1
@@ -368,26 +376,81 @@ def _scan_max_note_durations(song) -> dict:
 
 
 def _parse_args():
-    """Parse CLI arguments: input.mod [output.fur] [--noise_insts=0,4,...]"""
+    """Parse CLI arguments.
+    Returns (positional, forced_noise, drop_channels, noise_channels).
+    """
     positional = []
-    forced_noise = set()
+    forced_noise = {}       # sample_index -> tick_count (0 = permanent)
+    drop_channels = []      # 1-based channel indices to remove
+    noise_channels = []     # 1-based channel indices to swap to PCE noise slots
     for arg in sys.argv[1:]:
         if arg.startswith("--noise_insts="):
-            for idx_str in arg[len("--noise_insts="):].split(","):
-                idx_str = idx_str.strip()
-                if idx_str.isdigit():
-                    forced_noise.add(int(idx_str))
+            for spec in arg[len("--noise_insts="):].split(","):
+                spec = spec.strip()
+                if ":" in spec:
+                    idx_str, ticks_str = spec.split(":", 1)
+                    if idx_str.isdigit() and ticks_str.isdigit():
+                        forced_noise[int(idx_str)] = int(ticks_str)
+                elif spec.isdigit():
+                    forced_noise[int(spec)] = 0  # permanent
+        elif arg.startswith("--drop_channels="):
+            for ch_str in arg[len("--drop_channels="):].split(","):
+                ch_str = ch_str.strip()
+                if ch_str.isdigit():
+                    drop_channels.append(int(ch_str))
+        elif arg.startswith("--noise_channel="):
+            for ch_str in arg[len("--noise_channel="):].split(","):
+                ch_str = ch_str.strip()
+                if ch_str.isdigit():
+                    noise_channels.append(int(ch_str))
+            noise_channels = noise_channels[:2]  # max 2
         else:
             positional.append(arg)
-    return positional, forced_noise
+    return positional, forced_noise, drop_channels, noise_channels
+
+
+def _drop_channels(song, drop_list):
+    """Remove 1-based channel indices from all patterns, update channel count."""
+    drop_set = set(d - 1 for d in drop_list)  # convert to 0-based
+    for pat in song.patterns:
+        for row in pat:
+            for idx in sorted(drop_set, reverse=True):
+                if idx < len(row):
+                    del row[idx]
+    new_ch = song.channels - len(drop_set & set(range(song.channels)))
+    print(f"  Dropped channels {drop_list} -> {new_ch} channels remain")
+    song.channels = new_ch
+
+
+def _swap_noise_channels(song, noise_list):
+    """Swap 1-based channel indices into PCE noise positions (ch5, ch6).
+    noise_list[0] swaps with ch5 (0-based 4), noise_list[1] with ch6 (0-based 5)."""
+    targets = [4, 5]  # 0-based PCE noise channel slots
+    for i, src_1based in enumerate(noise_list):
+        src = src_1based - 1  # 0-based
+        tgt = targets[i]
+        if src == tgt:
+            continue
+        if src >= song.channels or tgt >= song.channels:
+            print(f"  WARNING: Cannot swap ch{src_1based} <-> ch{tgt+1}: "
+                  f"only {song.channels} channels")
+            continue
+        print(f"  Swapping ch{src_1based} <-> ch{tgt+1} (PCE noise slot)")
+        for pat in song.patterns:
+            for row in pat:
+                if src < len(row) and tgt < len(row):
+                    row[src], row[tgt] = row[tgt], row[src]
 
 
 def main():
-    positional, forced_noise = _parse_args()
+    positional, forced_noise, drop_channels_list, noise_channels = _parse_args()
 
     if len(positional) < 1:
-        print("Usage: python convert_mod.py <input.mod> [output.fur] [--noise_insts=5,8]")
-        print("  --noise_insts=N,M   Force sample indices (0-based) to noise channel")
+        print("Usage: python convert_mod.py <input> [output.fur] [options]")
+        print("  --noise_insts=N,M     Force sample indices (0-based) to noise channel")
+        print("                        N:T = burst noise for T ticks (e.g. 7:2)")
+        print("  --drop_channels=N,M   Remove channels (1-based) before conversion")
+        print("  --noise_channel=N[,M] Swap channel N to PCE noise slot (ch5/ch6)")
         sys.exit(1)
 
     input_path = Path(positional[0])
@@ -397,17 +460,32 @@ def main():
 
     output_path = Path(positional[1]) if len(positional) > 1 else input_path.with_suffix(".fur")
 
-    print(f"Converting MOD -> Furnace .fur")
+    # Auto-detect format by extension
+    ext = input_path.suffix.lower()
+    fmt_name = "XM" if ext == ".xm" else "MOD"
+
+    print(f"Converting {fmt_name} -> Furnace .fur")
     print(f"Input : {input_path}")
     print(f"Output: {output_path}")
     print("-" * 60)
 
-    # 1. Parse MOD
-    song: ModSong = parse_mod(str(input_path))
+    # 1. Parse input
+    if ext == ".xm":
+        song: ModSong = parse_xm(str(input_path))
+    else:
+        song: ModSong = parse_mod(str(input_path))
+
+    # 1b. Drop channels (before noise swap and limit)
+    if drop_channels_list:
+        _drop_channels(song, drop_channels_list)
+
+    # 1c. Swap noise channels into PCE noise slots
+    if noise_channels:
+        _swap_noise_channels(song, noise_channels)
 
     # 2. Limit to 6 channels
     if song.channels > 6:
-        print(f"WARNING: MOD has {song.channels} channels -> limiting to 6 for PC Engine.")
+        print(f"WARNING: {fmt_name} has {song.channels} channels -> limiting to 6 for PC Engine.")
         song.limit_to_6_channels()
 
     # 3. Export samples as WAV zip
@@ -415,7 +493,7 @@ def main():
     print("Exporting samples...")
     export_samples_zip(song.samples, str(zip_path))
 
-    # 4. Process samples → wavetables + macros
+    # 4. Process samples -> wavetables + macros
     # First, scan max note duration per instrument from pattern data
     max_note_rows = _scan_max_note_durations(song)
 
@@ -432,22 +510,30 @@ def main():
             noise_instruments.add(i)
 
     # Apply --noise overrides: force specified samples to noise classification
-    for i in forced_noise:
-        if i < len(sample_data) and sample_data[i]["classification"] != "noise":
+    for i, ticks in forced_noise.items():
+        if i < len(sample_data):
             old_cls = sample_data[i]["classification"]
             sample_data[i]["classification"] = "noise"
-            sample_data[i]["noise_env"] = [1]
-            sample_data[i]["noise_loop"] = 0
+            if ticks > 0:
+                # Burst noise: N ticks on, then off (no loop)
+                sample_data[i]["noise_env"] = [1] * ticks + [0]
+                sample_data[i]["noise_loop"] = None
+            else:
+                # Permanent noise
+                sample_data[i]["noise_env"] = [1]
+                sample_data[i]["noise_loop"] = 0
             noise_instruments.add(i)
             sname = song.samples[i].name if i < len(song.samples) else f"Sample_{i}"
-            print(f"  --noise override: Sample {i} ({sname}) {old_cls} -> noise")
+            tag = f" ({ticks}-tick burst)" if ticks > 0 else " (permanent)"
+            print(f"  --noise override: Sample {i} ({sname}) {old_cls} -> noise{tag}")
 
     # 4b. Scan which instruments are actually used in patterns
     used_instruments = set()
+    num_samples = len(song.samples)
     for pat in song.patterns:
         for row_notes in pat:
             for mn in row_notes:
-                if mn.instrument >= 0:
+                if 0 <= mn.instrument < num_samples:
                     used_instruments.add(mn.instrument)
 
     # 4c. Optimize wavetables: compact, dedup, canonical substitution
@@ -480,7 +566,12 @@ def main():
         author="MOD to Furnace Converter"
     )
     writer.set_orders(song.orders[:song.song_length])
-    writer.set_rows_per_pattern(64)
+
+    # Variable rows per pattern: use the longest pattern in the file
+    rows_per_pattern = 64
+    if song.patterns:
+        rows_per_pattern = max(len(pat) for pat in song.patterns)
+    writer.set_rows_per_pattern(rows_per_pattern)
     writer.set_tempo(song.initial_speed, song.initial_bpm)
 
     # Add only used instruments with compacted indices
@@ -547,14 +638,18 @@ def main():
                     elif octave > 7:
                         octave = 7
 
-                if ins >= 0 and ins in ins_remap:
-                    ins = ins_remap[ins]
+                if ins >= 0:
+                    if ins in ins_remap:
+                        ins = ins_remap[ins]
+                    else:
+                        ins = -1  # strip non-existing instrument
                 rows.append({
                     "note": note,
                     "octave": octave,
                     "instrument": ins,
                     "mod_effect": mod_note.effect,
                     "mod_param": mod_note.effect_arg,
+                    "xm_volume": getattr(mod_note, 'xm_volume', -1),
                 })
             raw_patterns[ch][pat_id] = rows
 
@@ -580,10 +675,15 @@ def main():
         max_fx_cols[ch] = min(max_fx_cols[ch], 8)
 
     # Phase 3: Noise migration pass (uses remapped instrument indices)
+    # Two sub-passes:
+    #   3a. Migrate noise notes from ch1-4 to free ch5/6 slots
+    #   3b. Inject 0x11 01 (noise on) / 0x11 00 (noise off) on ch5/6
     noise_instruments_remapped = set()
     for orig in noise_instruments:
         if orig in ins_remap:
             noise_instruments_remapped.add(ins_remap[orig])
+
+    # 3a. Migrate noise from ch1-4 -> ch5/6
     for ch in range(4):
         for pat_id in range(len(song.patterns)):
             rows = all_patterns[ch][pat_id]
@@ -597,11 +697,7 @@ def main():
                                                      row_idx, [4, 5])
                 if target_ch is not None:
                     migrated_row = dict(row)
-                    # Inject 11xx=01 (noise enable) for HuTrack compatibility
-                    # 0x11=noise toggle (01=on, 00=off), NOT 0x17 (PCM mode)
-                    # Effects are packed as cmd | (val << 8)
                     fx = list(migrated_row.get("effects", []))
-                    fx.append(0x11 | (0x01 << 8))
                     migrated_row["effects"] = fx
                     all_patterns[target_ch][pat_id][row_idx] = migrated_row
                     rows[row_idx] = {
@@ -609,13 +705,126 @@ def main():
                         "volume": -1, "effects": [],
                     }
                     noise_migrated += 1
-                    # Update max effect columns for target channel
-                    if len(fx) > max_fx_cols[target_ch]:
-                        max_fx_cols[target_ch] = min(len(fx), 8)
                 else:
                     noise_warnings.append(
                         f"  WARNING: Noise ins {ins} on ch {ch+1}, "
                         f"pat {pat_id} row {row_idx} - ch 5/6 occupied")
+
+    # 3b. Inject 0x11 on ch5/6: noise_on when a noise instrument plays,
+    #     noise_off when a non-noise instrument plays after noise.
+    #     Reset tracking per pattern (patterns reused across order positions).
+    for ch in (4, 5):
+        for pat_id in range(len(song.patterns)):
+            if pat_id not in all_patterns[ch]:
+                continue
+            rows = all_patterns[ch][pat_id]
+            noise_active = False
+            for row_idx, row in enumerate(rows):
+                ins = row["instrument"]
+                has_note = row["note"] != 0
+
+                if ins >= 0 and ins in noise_instruments_remapped and has_note:
+                    if not noise_active:
+                        fx = list(row.get("effects", []))
+                        fx.append(0x11 | (0x01 << 8))  # noise on
+                        row["effects"] = fx
+                        noise_active = True
+                        if len(fx) > max_fx_cols[ch]:
+                            max_fx_cols[ch] = min(len(fx), 8)
+                elif ins >= 0 and ins not in noise_instruments_remapped and has_note:
+                    if noise_active:
+                        fx = list(row.get("effects", []))
+                        fx.append(0x11 | (0x00 << 8))  # noise off
+                        row["effects"] = fx
+                        noise_active = False
+                        if len(fx) > max_fx_cols[ch]:
+                            max_fx_cols[ch] = min(len(fx), 8)
+
+    # Phase 4: Arpeggio -> instrument macro conversion
+    # PCE doesn't support arpeggio as a tracker effect -- we convert each unique
+    # (base_instrument, arp_param) into a cloned instrument with an arp macro.
+    arp_clone_map = {}   # (base_ins, arp_param) -> new_instrument_index
+    next_ins_id = len(used_sorted)  # next available instrument index
+
+    for ch in range(6):
+        for pat_id in sorted(all_patterns[ch].keys()):
+            rows = all_patterns[ch][pat_id]
+            effective_ins = -1
+            for row_idx, row in enumerate(rows):
+                # Track effective instrument (last explicitly set)
+                if row["instrument"] >= 0:
+                    effective_ins = row["instrument"]
+
+                arp_found = None
+                arp_stop = False
+                for fx_word in row["effects"]:
+                    fx_cmd = fx_word & 0xFF
+                    fx_val = (fx_word >> 8) & 0xFF
+                    if fx_cmd == 0x00 and fx_val != 0:
+                        arp_found = fx_val
+                    elif fx_cmd == 0x00 and fx_val == 0:
+                        arp_stop = True
+
+                if arp_found is not None and effective_ins >= 0:
+                    key = (effective_ins, arp_found)
+                    if key not in arp_clone_map:
+                        arp_clone_map[key] = next_ins_id
+                        next_ins_id += 1
+                    clone_id = arp_clone_map[key]
+                    row["instrument"] = clone_id
+                elif arp_stop and effective_ins >= 0:
+                    # Restore base instrument when arpeggio stops
+                    base_ins = effective_ins
+                    for (bi, ap), ci in arp_clone_map.items():
+                        if ci == effective_ins:
+                            base_ins = bi
+                            break
+                    row["instrument"] = base_ins
+                    effective_ins = base_ins
+
+    # Create arpeggio clone instruments
+    arp_clones_created = 0
+    for (base_ins, arp_param), clone_id in sorted(arp_clone_map.items(),
+                                                   key=lambda x: x[1]):
+        x = (arp_param >> 4) & 0x0F  # high nibble = semitones up 1
+        y = arp_param & 0x0F          # low nibble = semitones up 2
+        arp_macro = [0, x, y]
+        # Find the base instrument's data to clone
+        base_orig_idx = used_sorted[base_ins] if base_ins < len(used_sorted) else 0
+        sd = sample_data[base_orig_idx]
+        base_name = song.samples[base_orig_idx].name if base_orig_idx < len(song.samples) else f"Sample_{base_orig_idx}"
+        wt_idx = ins_wt_map[base_orig_idx]
+        writer.add_instrument(
+            idx=clone_id,
+            name=f"{base_name} arp{arp_param:02X}",
+            volume_env=sd["volume_env"],
+            volume_loop=sd["volume_loop"],
+            volume_release=sd["volume_release"],
+            wavetable_index=wt_idx,
+            noise_env=sd["noise_env"],
+            noise_loop=sd["noise_loop"] if sd["noise_loop"] is not None else 255,
+            arp_env=arp_macro,
+            arp_loop=0,
+        )
+        arp_clones_created += 1
+
+    if arp_clones_created:
+        print(f"  Arpeggio: {len(arp_clone_map)} patterns -> "
+              f"{arp_clones_created} clone instruments")
+        for (base_ins, arp_param), clone_id in sorted(arp_clone_map.items(),
+                                                       key=lambda x: x[1]):
+            x = (arp_param >> 4) & 0x0F
+            y = arp_param & 0x0F
+            print(f"    Ins {clone_id}: base={base_ins} arp=[0,{x},{y}] "
+                  f"(0x{arp_param:02X})")
+        # Recalculate max effect columns after arp removal
+        max_fx_cols = [1] * 6
+        for ch in range(6):
+            for pat_id in all_patterns[ch]:
+                for row in all_patterns[ch][pat_id]:
+                    if len(row["effects"]) > max_fx_cols[ch]:
+                        max_fx_cols[ch] = len(row["effects"])
+            max_fx_cols[ch] = min(max_fx_cols[ch], 8)
 
     # Set effect columns after noise migration (17xx may have added columns)
     writer.set_effect_cols(max_fx_cols)
@@ -634,7 +843,8 @@ def main():
     print(f"   Song name   : {song.name}")
     print(f"   Channels    : 6 (PC Engine)")
     print(f"   Patterns    : {len(song.patterns)}")
-    print(f"   Instruments : {len(used_sorted)} (of {len(song.samples)} samples)")
+    print(f"   Instruments : {len(used_sorted)} (of {len(song.samples)} samples)"
+          + (f" + {arp_clones_created} arp clones" if arp_clones_created else ""))
     print(f"   Wavetables  : {len(wt_list)} unique")
     classifications = {}
     for sd in sample_data:

@@ -1,5 +1,5 @@
 # lib/fur_writer.py
-# Furnace .fur writer — v232 (INFO format) for Furnace 0.6.8.3
+# Furnace .fur writer -- v232 (INFO format) for Furnace 0.6.8.3
 # Derived directly from fur.cpp saveFur() in furnace-0.6.8.3 source.
 
 import struct
@@ -44,14 +44,15 @@ class FurWriter:
     def add_instrument(self, idx: int, name: str, volume_env: list = None,
                        volume_loop: int = 255, volume_release: int = 255,
                        wavetable_index: int = 0, noise_env: list = None,
-                       noise_loop: int = 255):
+                       noise_loop: int = 255,
+                       arp_env: list = None, arp_loop: int = 255):
         self.instruments.append({
             "name": name,
             "volume_env": volume_env or [31],
             "volume_loop": volume_loop,
             "volume_release": volume_release,
-            "arp_env": [0],
-            "arp_loop": 255,
+            "arp_env": arp_env or [0],
+            "arp_loop": arp_loop,
             "wave_env": [wavetable_index],
             "wave_loop": 255,
             "noise_env": noise_env,
@@ -70,7 +71,7 @@ class FurWriter:
             self.patterns[channel] = {}
         self.patterns[channel][pattern_id] = rows
 
-    # ─── helpers ───
+    # --- helpers ---
 
     def _write_str(self, buf: bytearray, s: str):
         """Null-terminated UTF-8 string (same as Furnace writeString(val, false))."""
@@ -80,7 +81,7 @@ class FurWriter:
     def _pack_into(self, buf: bytearray, fmt: str, *args):
         buf.extend(struct.pack(fmt, *args))
 
-    # ─── build ───
+    # --- build ---
 
     def build(self) -> bytes:
         """Build a v232 .fur file using the INFO block format."""
@@ -102,14 +103,14 @@ class FurWriter:
 
         raw = bytearray()
 
-        # ── HEADER (32 bytes) ──
+        # -- HEADER (32 bytes) --
         raw.extend(b"-Furnace module-")
         self._pack_into(raw, '<H', DIV_ENGINE_VERSION)
         self._pack_into(raw, '<H', 0)             # reserved
         self._pack_into(raw, '<I', 32)             # song info pointer
         raw.extend(b'\x00' * 8)                    # reserved
 
-        # ── INFO block ──
+        # -- INFO block --
         raw.extend(b"INFO")
         info_size_pos = len(raw)
         self._pack_into(raw, '<I', 0)             # placeholder for block size
@@ -183,7 +184,7 @@ class FurWriter:
         pat_ptr_pos = len(raw)
         raw.extend(b'\x00' * (num_pats * 4))
 
-        # Orders — CHANNEL-major (outer=channel, inner=order position)
+        # Orders -- CHANNEL-major (outer=channel, inner=order position)
         for ch in range(num_channels):
             for order in self.orders:
                 raw.append(order)
@@ -283,15 +284,15 @@ class FurWriter:
         # Groove list (>=139)
         raw.append(0)                              # no grooves
 
-        # Asset directory pointers (>=156) — placeholder
+        # Asset directory pointers (>=156) -- placeholder
         adir_ptr_pos = len(raw)
         raw.extend(b'\x00' * 12)                   # 3 x u32
 
-        # ── Patch INFO block size ──
+        # -- Patch INFO block size --
         info_size = len(raw) - info_data_start
         struct.pack_into('<I', raw, info_size_pos, info_size)
 
-        # ── ADIR blocks (3 required: instruments, wavetables, samples) ──
+        # -- ADIR blocks (3 required: instruments, wavetables, samples) --
         adir_offsets = []
         for _ in range(3):
             adir_offsets.append(len(raw))
@@ -301,7 +302,7 @@ class FurWriter:
         for i, off in enumerate(adir_offsets):
             struct.pack_into('<I', raw, adir_ptr_pos + i * 4, off)
 
-        # ── INS2 blocks ──
+        # -- INS2 blocks --
         ins_offsets = []
         for inst in self.instruments:
             ins_offsets.append(len(raw))
@@ -309,7 +310,7 @@ class FurWriter:
         for i, off in enumerate(ins_offsets):
             struct.pack_into('<I', raw, ins_ptr_pos + i * 4, off)
 
-        # ── WAVE blocks ──
+        # -- WAVE blocks --
         wav_offsets = []
         for idx, wt in enumerate(self.wavetables):
             wav_offsets.append(len(raw))
@@ -317,7 +318,7 @@ class FurWriter:
         for i, off in enumerate(wav_offsets):
             struct.pack_into('<I', raw, wav_ptr_pos + i * 4, off)
 
-        # ── PATN blocks (v232: 1-byte channel) ──
+        # -- PATN blocks (v232: 1-byte channel) --
         pat_offsets = []
         for subsong, ch, pat_id in pats_to_write:
             rows = self.patterns[ch][pat_id]
@@ -329,7 +330,7 @@ class FurWriter:
         return zlib.compress(bytes(raw), level=9)
 
     def _build_ins2(self, inst: dict) -> bytes:
-        """INS2 — Feature-based instrument (NA/MA/EN codes)."""
+        """INS2 -- Feature-based instrument (NA/MA/EN codes)."""
         data = bytearray()
         data.extend(struct.pack('<H', DIV_ENGINE_VERSION))
         data.extend(struct.pack('<H', 5))                   # type = PCE wavetable
@@ -376,7 +377,7 @@ class FurWriter:
         ma.append(0); ma.append(1)
         ma.extend(bytes(wav))
 
-        # Noise/EX1 macro (code=5) — only if present
+        # Noise/EX1 macro (code=5) -- only if present
         noise = inst.get("noise_env")
         if noise:
             noise_loop = inst.get("noise_loop", 255)
@@ -522,4 +523,4 @@ class FurWriter:
         data = self.build()
         with open(filepath, "wb") as f:
             f.write(data)
-        print(f"✓ Saved Furnace file: {filepath} ({len(data):,} bytes)")
+        print(f"[ok] Saved Furnace file: {filepath} ({len(data):,} bytes)")
