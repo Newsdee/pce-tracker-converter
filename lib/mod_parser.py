@@ -61,6 +61,30 @@ class ModSong:
             for row in pat:
                 row[:] = row[:6]
 
+    def split_channels(self, keep):
+        """Return a new ModSong keeping only the given 0-based channel indices.
+
+        The original song is not modified.
+        """
+        import copy
+        s = ModSong()
+        s.name = self.name
+        s.channels = len(keep)
+        s.song_length = self.song_length
+        s.restart_position = self.restart_position
+        s.orders = list(self.orders)
+        s.samples = self.samples  # shared (read-only)
+        s.initial_speed = self.initial_speed
+        s.initial_bpm = self.initial_bpm
+        s.patterns = []
+        for pat in self.patterns:
+            new_pat = []
+            for row in pat:
+                new_pat.append([row[ch] if ch < len(row) else ModNote()
+                                for ch in keep])
+            s.patterns.append(new_pat)
+        return s
+
 
 def period_to_note_and_octave(period: int) -> tuple[int, int]:
     """Convert MOD period to (Furnace note, octave)"""

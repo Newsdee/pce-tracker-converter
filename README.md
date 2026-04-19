@@ -1,6 +1,6 @@
-# MOD/XM → Furnace Converter for PC Engine
+# MOD/XM/S3M → Furnace Converter for PC Engine
 
-Converts ProTracker `.mod` and FastTracker II `.xm` files into Furnace `.fur` tracker files targeting the **PC Engine / TurboGrafx-16** sound chip (HuC6280, 6 wavetable channels).
+Converts ProTracker `.mod`, FastTracker II `.xm`, and Scream Tracker `.s3m` files into Furnace `.fur` tracker files targeting the **PC Engine / TurboGrafx-16** sound chip (HuC6280, 6 wavetable channels).
 
 ## Quick Start
 
@@ -10,13 +10,16 @@ python convert_mod.py input.mod output.fur      # explicit output path
 python convert_mod.py input.mod --noise_insts=5,8  # force samples 5,8 to noise channels
 python convert_mod.py song.xm                   # auto-detects XM format
 python convert_mod.py song.xm --drop_channels=5,6 --noise_channel=4
+python convert_mod.py song.s3m                   # auto-detects S3M format
+python convert_mod.py song.s3m --merge_channels=auto     # auto-merge to fit 6 channels
+python convert_mod.py song.s3m --split_extra             # save overflow channels to second .fur
 ```
 
 Requires Python 3.8+ and NumPy.
 
 ## What It Does
 
-1. **Parses** MOD (4/6/8-channel ProTracker) or XM (FastTracker II, any channel count) files
+1. **Parses** MOD (4/6/8-channel ProTracker), XM (FastTracker II, any channel count), or S3M (Scream Tracker 3, any channel count) files
 2. **Classifies** each sample/instrument as tonal, percussive, or noise
 3. **Extracts** 32-sample 5-bit wavetables from sample data using single-cycle detection
 4. **Maps** MOD/XM effects to Furnace effect IDs with persistent-effect re-emission
@@ -34,19 +37,24 @@ convert_mod.bat         Windows batch runner
 lib/
   mod_parser.py         ProTracker MOD parser (samples, patterns, orders)
   xm_parser.py          FastTracker II XM parser (instruments, envelopes, packed patterns)
+  s3m_parser.py         Scream Tracker S3M parser (packed patterns, unsigned samples)
   fur_writer.py         Furnace .fur writer (v232 INFO format, zlib compressed)
   sample_processor.py   Sample → wavetable conversion + instrument macros
   effect_mapper.py      MOD → Furnace effect ID mapping (reference; not used by persistence engine)
+  merge_analysis.py     Channel merge analysis — scoring, plan generation, auto-merge
 
 tools/
   analyze_octaves.py    Diagnostic — fundamental period detection per sample
   dump_pattern.py       Inspect PATN blocks with effectMask decoding
   dump_wavetables.py    Inspect wavetable data from a MOD file
   verify_fur.py         Validate .fur file structure (block pointers, counts)
+  merge_analysis.py     Standalone merge analysis report (imports from lib/)
+  regression_test.py    Regression test runner across all examples
 
 examples/
   TinyTune/             MOD example with convert.bat
   LittleSwedishGirl/    XM example with convert.bat (9ch, --drop_channels demo)
+  SatteliteOne/         S3M example with convert.bat (8ch, --drop_channels + --merge_channels demos)
 ```
 
 ## Technical Details
@@ -192,7 +200,7 @@ python tools/verify_fur.py Tinytune_new.fur
 
 ## Limitations
 
-- **6 channels max**: Files with more than 6 channels are truncated (PCE has 6 wavetable channels). Use `--drop_channels` to choose which channels to remove before truncation
+- **6 channels max**: Files with more than 6 channels are truncated (PCE has 6 wavetable channels). Use `--drop_channels` to choose which to remove, `--merge_channels` to fold channels together preserving notes, or `--split_extra` to save overflow channels to a second `.fur` file
 - **No PCM sample support**: Long samples are converted to single-cycle wavetables, not PCM. Original samples are exported to a `.zip` for reference
 - **Finetune ignored**: The MOD sample finetune field (sub-semitone tuning) is not yet mapped to Furnace detune
 - **Noise channel**: Noise-classified instruments are migrated to channels 5-6 (PCE noise channels) when possible, but polyphonic noise may be dropped. Use `--noise_insts` to manually tag instruments that should use noise mode
@@ -200,7 +208,77 @@ python tools/verify_fur.py Tinytune_new.fur
 - **XM multi-sample instruments**: Only the most-used sub-sample (by note mapping frequency) is kept per instrument. Other sub-samples are discarded
 - **XM volume column priority**: When both the volume column and effect column contain an effect, the effect column wins; the volume column effect is lost
 
-## XM-Specific Features
+## S3M-Specific Features
+
+### Format Support
+
+Scream Tracker 3 `.s3m` files are auto-detected by extension. Key differences from MOD/XM handled by the parser:
+
+- **Packed patterns**: S3M uses a per-row channel mask with flag-based field packing (note+inst, volume, effect+param)
+- **Unsigned 8-bit samples**: S3M samples are unsigned (bias 128), converted to signed for processing
+- **Pattern break (Cxx)**: S3M Cxx param is plain hex, unlike MOD's BCD encoding — the parser converts to BCD for the downstream pipeline
+- **Global volume**: Scaled into per-channel volume calculations
+
+### Channel Merging
+
+When a song has more channels than the PCE's 6, merging folds a donor channel's notes into a target channel's gaps (silent rows) — preserving notes that would otherwise be lost by truncation.
+
+**`--merge_channels=D:T[,D2:T2]`** — Manual merge (1-based channels):
+```bash
+python convert_mod.py song.s3m out.fur --merge_channels=5:3,7:6
+```
+Donor 5 merges into target 3, then donor 7 into target 6. Donors are removed after merge. If the donor note conflicts with an existing target note, the donor note is lost.
+
+**`--merge_channels=auto`** — Auto-select optimal merge plan:
+```bash
+python convert_mod.py song.s3m out.fur --merge_channels=auto
+```
+Evaluates all possible merge+drop combinations to maximize preserved notes. Prints the chosen plan and proceeds with conversion.
+
+**`--merge_channels=analyze`** — Print analysis report and exit:
+```bash
+python convert_mod.py song.s3m out.fur --merge_channels=analyze
+```
+Shows per-channel activity, pairwise merge scores, and ranked plans with preservation percentages. Use this to inform manual `--merge_channels` decisions.
+
+**Standalone analysis tool**:
+```bash
+python tools/merge_analysis.py song.s3m
+```
+
+#### Merge Scoring
+
+For each donor→target pair, the analyzer computes:
+- **preserved**: donor notes that fill target gaps (no conflict)
+- **conflicts**: rows where both channels have notes (donor note lost)
+- **pct_preserved**: preserved / total donor notes
+
+Plans are ranked by total preserved notes across all merges + remaining channels.
+
+#### Processing Order
+
+`drop → merge → noise swap → split_extra → limit_to_6`
+
+Merges run before truncation, so channels beyond 6 can be merged into channels 1–6 instead of being silently dropped.
+
+### Split Extra Channels
+
+**`--split_extra`** saves overflow channels (7+) to a separate `.fur` file instead of discarding them:
+
+```bash
+python convert_mod.py song.s3m out.fur --split_extra
+# Produces: out.fur (channels 1-6) + out_extra.fur (channels 7+)
+```
+
+The extra `.fur` shares the same instruments, wavetables, tempo, and order list as the main file. It pads to 6 Furnace channels (PCE requirement) with empty rows for unused slots. This allows manual refinement in Furnace — you can cherry-pick parts from the extra file into the main conversion.
+
+Combinable with other options:
+```bash
+python convert_mod.py song.s3m out.fur --merge_channels=5:3 --split_extra
+# Merges ch5→ch3, then splits remaining overflow to extra .fur
+```
+
+
 
 ### Format Auto-Detection
 

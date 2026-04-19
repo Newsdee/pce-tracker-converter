@@ -1,7 +1,8 @@
 # convert_mod.py
-# MOD/XM -> Furnace .fur Converter for PC Engine (6 channels)
+# MOD/XM/S3M -> Furnace .fur Converter for PC Engine (6 channels)
 # Usage: python convert_mod.py input.mod [output.fur]
 #        python convert_mod.py input.xm  [output.fur] [--drop_channels=5,6] [--noise_channel=4]
+#        python convert_mod.py input.s3m [output.fur] [--drop_channels=3,8]
 
 import sys
 import math
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 
 from mod_parser import parse_mod, ModSong, ModNote
 from xm_parser import parse_xm
+from s3m_parser import parse_s3m
 from sample_processor import process_samples_for_pce, export_samples_zip
 from fur_writer import FurWriter
 
@@ -377,12 +379,15 @@ def _scan_max_note_durations(song) -> dict:
 
 def _parse_args():
     """Parse CLI arguments.
-    Returns (positional, forced_noise, drop_channels, noise_channels).
+    Returns (positional, forced_noise, drop_channels, noise_channels, merge_pairs).
     """
     positional = []
     forced_noise = {}       # sample_index -> tick_count (0 = permanent)
     drop_channels = []      # 1-based channel indices to remove
     noise_channels = []     # 1-based channel indices to swap to PCE noise slots
+    merge_pairs = []        # list of (donor_1based, target_1based) or "auto"/"analyze"
+    merge_mode = None        # None, "auto", or "analyze"
+    split_extra = False
     for arg in sys.argv[1:]:
         if arg.startswith("--noise_insts="):
             for spec in arg[len("--noise_insts="):].split(","):
@@ -404,9 +409,22 @@ def _parse_args():
                 if ch_str.isdigit():
                     noise_channels.append(int(ch_str))
             noise_channels = noise_channels[:2]  # max 2
+        elif arg.startswith("--merge_channels="):
+            val = arg[len("--merge_channels="):].strip()
+            if val in ("auto", "analyze"):
+                merge_mode = val
+            else:
+                for spec in val.split(","):
+                    spec = spec.strip()
+                    if ":" in spec:
+                        parts = spec.split(":", 1)
+                        if parts[0].isdigit() and parts[1].isdigit():
+                            merge_pairs.append((int(parts[0]), int(parts[1])))
+        elif arg == "--split_extra":
+            split_extra = True
         else:
             positional.append(arg)
-    return positional, forced_noise, drop_channels, noise_channels
+    return positional, forced_noise, drop_channels, noise_channels, merge_pairs, merge_mode, split_extra
 
 
 def _drop_channels(song, drop_list):
@@ -420,6 +438,96 @@ def _drop_channels(song, drop_list):
     new_ch = song.channels - len(drop_set & set(range(song.channels)))
     print(f"  Dropped channels {drop_list} -> {new_ch} channels remain")
     song.channels = new_ch
+
+
+def _merge_channels(song, merge_pairs):
+    """Merge donor channels into target channels (both 1-based).
+
+    For each (donor, target) pair: where the target row has no note,
+    copy the donor's note/instrument/effect into the target. Where both
+    have notes, the target wins (donor note is lost).
+
+    After merging, the donor channel is removed (like a drop).
+    Pairs are processed in order; channel indices shift after each removal.
+    """
+    for donor_1, target_1 in merge_pairs:
+        donor = donor_1 - 1   # 0-based
+        target = target_1 - 1
+        if donor >= song.channels or target >= song.channels:
+            print(f"  WARNING: merge ch{donor_1}->ch{target_1}: "
+                  f"only {song.channels} channels, skipping")
+            continue
+        if donor == target:
+            print(f"  WARNING: merge ch{donor_1}->ch{target_1}: same channel, skipping")
+            continue
+
+        preserved = 0
+        conflicts = 0
+        donor_total = 0
+
+        for pat in song.patterns:
+            for row in pat:
+                if donor >= len(row) or target >= len(row):
+                    continue
+                d = row[donor]
+                t = row[target]
+                d_has_note = d.note > 0 and d.note < 254
+                t_has_note = t.note > 0 and t.note < 254
+
+                if d_has_note:
+                    donor_total += 1
+
+                if d_has_note and not t_has_note:
+                    # Fill gap: copy donor into target
+                    row[target] = ModNote(
+                        note=d.note,
+                        octave=d.octave,
+                        instrument=d.instrument,
+                        effect=d.effect,
+                        effect_arg=d.effect_arg,
+                        xm_volume=d.xm_volume,
+                    )
+                    preserved += 1
+                elif d_has_note and t_has_note:
+                    conflicts += 1
+                elif not d_has_note and (d.effect > 0 or d.xm_volume >= 0):
+                    # Donor has effect/volume but no note -- merge if target slot is free
+                    if t.effect == 0 and t.effect_arg == 0 and d.effect > 0:
+                        row[target] = ModNote(
+                            note=t.note,
+                            octave=t.octave,
+                            instrument=t.instrument,
+                            effect=d.effect,
+                            effect_arg=d.effect_arg,
+                            xm_volume=t.xm_volume if t.xm_volume >= 0 else d.xm_volume,
+                        )
+
+        # Remove the donor channel (same as drop)
+        for pat in song.patterns:
+            for row in pat:
+                if donor < len(row):
+                    del row[donor]
+        song.channels -= 1
+
+        pct = (preserved / donor_total * 100) if donor_total > 0 else 0
+        print(f"  Merged ch{donor_1} -> ch{target_1}: "
+              f"{preserved}/{donor_total} notes preserved, "
+              f"{conflicts} conflicts (lost) [{pct:.0f}% saved]")
+
+        # Adjust subsequent pairs: indices shift after removal
+        # Channels above the removed donor shift down by 1
+        adjusted = []
+        for d1, t1 in merge_pairs:
+            if (d1, t1) == (donor_1, target_1):
+                continue  # already processed
+            nd = d1 - (1 if d1 > donor_1 else 0)
+            nt = t1 - (1 if t1 > donor_1 else 0)
+            adjusted.append((nd, nt))
+        merge_pairs = adjusted  # doesn't affect outer loop (already iterating copy)
+        # But we need to break and recurse for remaining pairs
+        if adjusted:
+            _merge_channels(song, adjusted)
+        return
 
 
 def _swap_noise_channels(song, noise_list):
@@ -442,15 +550,78 @@ def _swap_noise_channels(song, noise_list):
                     row[src], row[tgt] = row[tgt], row[src]
 
 
+def _print_analysis_report(song, ranked_plans):
+    """Print channel merge analysis report (--merge_channels=analyze)."""
+    from merge_analysis import channel_activity, all_merge_scores, plan_to_cli
+
+    n_ch = song.channels
+    stats = channel_activity(song)
+    total_notes = sum(s["note_rows"] for s in stats)
+
+    print()
+    print("=" * 70)
+    print("CHANNEL ACTIVITY")
+    print("=" * 70)
+    print(f"  {'Ch':>3} {'Notes':>6} {'Active':>7} {'Density':>8} {'Instruments':>20}")
+    print(f"  {'---':>3} {'-----':>6} {'------':>7} {'-------':>8} {'-----------':>20}")
+    for s in stats:
+        ins_str = ",".join(str(i) for i in s["instruments"])
+        print(f"  {s['ch']+1:3d} {s['note_rows']:6d} {s['active_rows']:7d} "
+              f"{s['density']:7.1f}% {ins_str:>20s}")
+    print(f"\n  Total note-rows: {total_notes}")
+
+    print()
+    print("=" * 70)
+    print("PAIRWISE MERGE SCORES (donor -> target)")
+    print("=" * 70)
+    scores = all_merge_scores(song)
+    scores.sort(key=lambda s: s["preserved"], reverse=True)
+    print(f"  {'Donor':>5} {'->':>3} {'Target':>6} {'Preserved':>10} {'Conflicts':>10} "
+          f"{'%Saved':>7}")
+    for s in scores[:15]:
+        print(f"  ch{s['donor']+1:d} {' ->':>3} ch{s['target']+1:d} "
+              f"{s['preserved']:10d} {s['conflicts']:10d} "
+              f"{s['pct_preserved']:6.1f}%")
+
+    print()
+    print("=" * 70)
+    print(f"BEST REDUCTION PLANS ({n_ch} -> 6 channels)")
+    print("=" * 70)
+    for rank, r in enumerate(ranked_plans[:10], 1):
+        plan_str = " + ".join(
+            f"drop(ch{a[1]+1})" if a[0] == "drop"
+            else f"merge(ch{a[2]+1}->ch{a[1]+1})"
+            for a in r["plan"]
+        )
+        print(f"  #{rank:2d}: {r['pct_kept']:5.1f}% kept "
+              f"({r['notes_kept']:4d}/{r['total_notes']:4d} notes, "
+              f"lost {r['notes_lost']:3d}"
+              f"{', merged ' + str(r['notes_from_merge']) if r['notes_from_merge'] else ''}"
+              f")")
+        print(f"       {plan_str}")
+
+    if ranked_plans:
+        best = ranked_plans[0]
+        print()
+        print("-" * 70)
+        print(f"BEST: {plan_to_cli(best['plan'])}")
+        print(f"  Or: --merge_channels=auto")
+
+
 def main():
-    positional, forced_noise, drop_channels_list, noise_channels = _parse_args()
+    positional, forced_noise, drop_channels_list, noise_channels, merge_pairs, merge_mode, split_extra = _parse_args()
 
     if len(positional) < 1:
         print("Usage: python convert_mod.py <input> [output.fur] [options]")
-        print("  --noise_insts=N,M     Force sample indices (0-based) to noise channel")
-        print("                        N:T = burst noise for T ticks (e.g. 7:2)")
-        print("  --drop_channels=N,M   Remove channels (1-based) before conversion")
-        print("  --noise_channel=N[,M] Swap channel N to PCE noise slot (ch5/ch6)")
+        print("  --noise_insts=N,M       Force sample indices (0-based) to noise channel")
+        print("                          N:T = burst noise for T ticks (e.g. 7:2)")
+        print("  --drop_channels=N,M     Remove channels (1-based) before conversion")
+        print("  --noise_channel=N[,M]   Swap channel N to PCE noise slot (ch5/ch6)")
+        print("  --merge_channels=D:T    Merge donor D into target T (1-based), then")
+        print("                          remove D. Repeatable: D1:T1,D2:T2")
+        print("  --merge_channels=auto   Auto-select best merge+drop plan")
+        print("  --merge_channels=analyze  Print analysis report and exit")
+        print("  --split_extra           Save overflow channels to a second .fur")
         sys.exit(1)
 
     input_path = Path(positional[0])
@@ -462,7 +633,8 @@ def main():
 
     # Auto-detect format by extension
     ext = input_path.suffix.lower()
-    fmt_name = "XM" if ext == ".xm" else "MOD"
+    fmt_names = {".xm": "XM", ".s3m": "S3M"}
+    fmt_name = fmt_names.get(ext, "MOD")
 
     print(f"Converting {fmt_name} -> Furnace .fur")
     print(f"Input : {input_path}")
@@ -472,20 +644,61 @@ def main():
     # 1. Parse input
     if ext == ".xm":
         song: ModSong = parse_xm(str(input_path))
+    elif ext == ".s3m":
+        song: ModSong = parse_s3m(str(input_path))
     else:
         song: ModSong = parse_mod(str(input_path))
 
-    # 1b. Drop channels (before noise swap and limit)
+    # 1b. Auto/analyze merge mode
+    if merge_mode in ("auto", "analyze") and song.channels > 6:
+        from merge_analysis import (find_best_plan, plan_to_cli, plan_to_actions,
+                                     channel_activity, all_merge_scores)
+        ranked = find_best_plan(song, target=6)
+        if merge_mode == "analyze":
+            _print_analysis_report(song, ranked)
+            sys.exit(0)
+        elif merge_mode == "auto" and ranked:
+            best = ranked[0]
+            auto_merges, auto_drops = plan_to_actions(best["plan"])
+            print(f"  Auto-merge: {plan_to_cli(best['plan'])}")
+            print(f"  Predicted: {best['pct_kept']:.1f}% notes kept "
+                  f"({best['notes_kept']}/{best['total_notes']})")
+            if auto_merges:
+                _merge_channels(song, auto_merges)
+            if auto_drops:
+                _drop_channels(song, auto_drops)
+    elif merge_mode in ("auto", "analyze") and song.channels <= 6:
+        if merge_mode == "analyze":
+            print(f"  Already {song.channels} channels, nothing to analyze.")
+            sys.exit(0)
+        else:
+            print(f"  Already {song.channels} channels, no auto-merge needed.")
+
+    # 1c. Merge channels (manual, before drop, noise swap, and limit)
+    if merge_pairs:
+        _merge_channels(song, merge_pairs)
+
+    # 1d. Drop channels (before noise swap and limit)
     if drop_channels_list:
         _drop_channels(song, drop_channels_list)
 
-    # 1c. Swap noise channels into PCE noise slots
+    # 1e. Swap noise channels into PCE noise slots
     if noise_channels:
         _swap_noise_channels(song, noise_channels)
 
-    # 2. Limit to 6 channels
+    # 2. Split extra channels before truncation
+    extra_song = None
+    if split_extra and song.channels > 6:
+        extra_chs = list(range(6, song.channels))
+        extra_song = song.split_channels(extra_chs)
+        extra_song.name = (song.name or input_path.stem) + " (extra)"
+        print(f"  Split: channels {[c+1 for c in extra_chs]} -> extra .fur "
+              f"({extra_song.channels} ch)")
+
+    # 2b. Limit to 6 channels
     if song.channels > 6:
-        print(f"WARNING: {fmt_name} has {song.channels} channels -> limiting to 6 for PC Engine.")
+        if not split_extra:
+            print(f"WARNING: {fmt_name} has {song.channels} channels -> limiting to 6 for PC Engine.")
         song.limit_to_6_channels()
 
     # 3. Export samples as WAV zip
@@ -631,7 +844,7 @@ def main():
                 # Apply octave correction for single-cycle extracted samples
                 effective_ins = ins if ins >= 0 else last_ins
                 if note != 0 and effective_ins >= 0 and effective_ins in octave_shift_map:
-                    octave += octave_shift_map[ins]
+                    octave += octave_shift_map[effective_ins]
                     # Clamp to valid Furnace range (0-7)
                     if octave < 0:
                         octave = 0
@@ -856,6 +1069,151 @@ def main():
         print(f"   Noise notes migrated to ch 5/6: {noise_migrated}")
     for w in noise_warnings:
         print(w)
+
+    # ---- Extra channels .fur (--split_extra) ----
+    if extra_song is not None:
+        extra_path = output_path.with_name(
+            output_path.stem + "_extra" + output_path.suffix)
+        print(f"\n{'=' * 60}")
+        print(f"Building extra channels .fur: {extra_path}")
+        print(f"  Channels: {extra_song.channels}")
+        _build_extra_fur(extra_song, extra_path, sample_data, song.samples,
+                         used_sorted, ins_remap, pce_volumes, wt_list,
+                         ins_wt_map, octave_shift_map, noise_instruments,
+                         forced_noise)
+
+
+def _build_extra_fur(extra_song, extra_path, sample_data, samples,
+                     used_sorted, ins_remap, pce_volumes, wt_list,
+                     ins_wt_map, octave_shift_map, noise_instruments,
+                     forced_noise):
+    """Build a .fur file for the overflow channels using shared instrument data."""
+    n_ch = min(extra_song.channels, 6)
+    if n_ch == 0:
+        return
+
+    # Limit to 6 if somehow >6 extra channels
+    if extra_song.channels > 6:
+        extra_song.limit_to_6_channels()
+        n_ch = 6
+
+    writer = FurWriter()
+    writer.set_song_info(
+        name=extra_song.name or "Extra channels",
+        author="MOD to Furnace Converter"
+    )
+    writer.set_orders(extra_song.orders[:extra_song.song_length])
+
+    rows_per_pattern = 64
+    if extra_song.patterns:
+        rows_per_pattern = max(len(pat) for pat in extra_song.patterns)
+    writer.set_rows_per_pattern(rows_per_pattern)
+    writer.set_tempo(extra_song.initial_speed, extra_song.initial_bpm)
+
+    # Re-scan used instruments in extra patterns
+    extra_used = set()
+    for pat in extra_song.patterns:
+        for row in pat:
+            for mn in row:
+                if 0 <= mn.instrument < len(samples):
+                    extra_used.add(mn.instrument)
+
+    # Use the same compact mapping as the main fur for consistency
+    # But only add instruments that appear in the extra channels
+    for new_idx, orig_idx in enumerate(used_sorted):
+        if orig_idx not in extra_used:
+            continue
+        sd = sample_data[orig_idx]
+        name = samples[orig_idx].name if orig_idx < len(samples) else f"Sample_{orig_idx}"
+        wt_idx = ins_wt_map[orig_idx]
+        writer.add_instrument(
+            idx=ins_remap[orig_idx],
+            name=name or f"Sample_{orig_idx}",
+            volume_env=sd["volume_env"],
+            volume_loop=sd["volume_loop"],
+            volume_release=sd["volume_release"],
+            wavetable_index=wt_idx,
+            noise_env=sd["noise_env"],
+            noise_loop=sd["noise_loop"] if sd["noise_loop"] is not None else 255,
+        )
+
+    for wt in wt_list:
+        writer.add_wavetable(wt)
+
+    # Build raw patterns with instrument remapping + octave correction
+    raw_patterns = {}
+    for ch in range(n_ch):
+        raw_patterns[ch] = {}
+        last_ins = -1
+        for pat_id, mod_pattern in enumerate(extra_song.patterns):
+            rows = []
+            for row_notes in mod_pattern:
+                if ch >= len(row_notes):
+                    mod_note = ModNote()
+                else:
+                    mod_note = row_notes[ch]
+                ins = mod_note.instrument
+                note = mod_note.note
+                octave = mod_note.octave
+
+                if ins >= 0:
+                    last_ins = ins
+                effective_ins = ins if ins >= 0 else last_ins
+                if note != 0 and effective_ins >= 0 and effective_ins in octave_shift_map:
+                    octave += octave_shift_map[effective_ins]
+                    octave = max(0, min(7, octave))
+
+                if ins >= 0:
+                    ins = ins_remap.get(ins, -1)
+                rows.append({
+                    "note": note,
+                    "octave": octave,
+                    "instrument": ins,
+                    "mod_effect": mod_note.effect,
+                    "mod_param": mod_note.effect_arg,
+                    "xm_volume": getattr(mod_note, 'xm_volume', -1),
+                })
+            raw_patterns[ch][pat_id] = rows
+
+    # Apply persistence
+    ins_default_vol = {}
+    for orig_idx in used_sorted:
+        new_idx = ins_remap[orig_idx]
+        ins_default_vol[new_idx] = pce_volumes[orig_idx]
+
+    all_patterns = {}
+    max_fx_cols = [1] * n_ch
+    for ch in range(n_ch):
+        all_patterns[ch] = {}
+        fx_usage = _scan_fx_usage(extra_song, ch)
+        for pat_id in raw_patterns[ch]:
+            converted = _apply_persistence(raw_patterns[ch][pat_id], fx_usage,
+                                           ins_default_vol)
+            all_patterns[ch][pat_id] = converted
+            for row in converted:
+                if len(row["effects"]) > max_fx_cols[ch]:
+                    max_fx_cols[ch] = len(row["effects"])
+        max_fx_cols[ch] = min(max_fx_cols[ch], 8)
+
+    # Pad to 6 channels for Furnace (PCE always has 6)
+    for ch in range(n_ch, 6):
+        max_fx_cols.append(1)
+        all_patterns[ch] = {}
+        for pat_id in range(len(extra_song.patterns)):
+            rows_per = len(extra_song.patterns[pat_id]) if pat_id < len(extra_song.patterns) else rows_per_pattern
+            all_patterns[ch][pat_id] = [
+                {"note": 0, "octave": 0, "instrument": -1, "volume": -1, "effects": []}
+                for _ in range(rows_per)
+            ]
+
+    writer.set_effect_cols(max_fx_cols[:6])
+    print(f"  Effect columns per ch: {max_fx_cols[:6]}")
+
+    for ch in range(6):
+        for pat_id in sorted(all_patterns[ch].keys()):
+            writer.add_pattern(ch, pat_id, all_patterns[ch][pat_id])
+
+    writer.save(str(extra_path))
 
 
 def _find_free_noise_channel(all_patterns, pat_id, row_idx, candidates):
