@@ -1,6 +1,6 @@
-# MOD/XM/S3M → Furnace Converter for PC Engine
+# MOD/XM/S3M/FTM → Furnace Converter for PC Engine
 
-Converts ProTracker `.mod`, FastTracker II `.xm`, and Scream Tracker `.s3m` files into Furnace `.fur` tracker files targeting the **PC Engine / TurboGrafx-16** sound chip (HuC6280, 6 wavetable channels).
+Converts ProTracker `.mod`, FastTracker II `.xm`, Scream Tracker `.s3m`, and FamiTracker `.ftm` files into Furnace `.fur` tracker files targeting the **PC Engine / TurboGrafx-16** sound chip (HuC6280, 6 wavetable channels).
 
 ## Quick Start
 
@@ -13,13 +13,15 @@ python convert_mod.py song.xm --drop_channels=5,6 --noise_channel=4
 python convert_mod.py song.s3m                   # auto-detects S3M format
 python convert_mod.py song.s3m --merge_channels=auto     # auto-merge to fit 6 channels
 python convert_mod.py song.s3m --split_extra             # save overflow channels to second .fur
+python convert_mod.py song.ftm                   # auto-detects FamiTracker format
+python convert_mod.py song.ftm output.fur        # explicit output path
 ```
 
 Requires Python 3.8+ and NumPy.
 
 ## What It Does
 
-1. **Parses** MOD (4/6/8-channel ProTracker), XM (FastTracker II, any channel count), or S3M (Scream Tracker 3, any channel count) files
+1. **Parses** MOD (4/6/8-channel ProTracker), XM (FastTracker II, any channel count), S3M (Scream Tracker 3, any channel count), or FTM (FamiTracker, NES 2A03) files
 2. **Classifies** each sample/instrument as tonal, percussive, or noise
 3. **Extracts** 32-sample 5-bit wavetables from sample data using single-cycle detection
 4. **Maps** MOD/XM effects to Furnace effect IDs with persistent-effect re-emission
@@ -27,6 +29,8 @@ Requires Python 3.8+ and NumPy.
 6. **Writes** a Furnace v232 `.fur` file compatible with Furnace 0.6.8.3
 
 For XM files, multi-sample instruments pick the most-used sub-sample, and XM volume envelopes are converted to PCE volume macros with sustain/loop/release mapping.
+
+For FTM files, volume and arpeggio envelopes from the SEQUENCES block are extracted and converted to Furnace instrument macros. NES 2A03 channels are mapped to PCE wavetable channels with appropriate volume scaling.
 
 ## Project Structure
 
@@ -38,6 +42,7 @@ lib/
   mod_parser.py         ProTracker MOD parser (samples, patterns, orders)
   xm_parser.py          FastTracker II XM parser (instruments, envelopes, packed patterns)
   s3m_parser.py         Scream Tracker S3M parser (packed patterns, unsigned samples)
+  ftm_parser.py         FamiTracker FTM parser (SEQUENCES, instruments, patterns)
   fur_writer.py         Furnace .fur writer (v232 INFO format, zlib compressed)
   sample_processor.py   Sample → wavetable conversion + instrument macros
   effect_mapper.py      MOD → Furnace effect ID mapping (reference; not used by persistence engine)
@@ -55,6 +60,7 @@ examples/
   TinyTune/             MOD example with convert.bat
   LittleSwedishGirl/    XM example with convert.bat (9ch, --drop_channels demo)
   SatteliteOne/         S3M example with convert.bat (8ch, --drop_channels + --merge_channels demos)
+  FamiTracker_EnhantedLands/  FTM example with convert.bat (volume + arpeggio envelopes)
 ```
 
 ## Technical Details
@@ -373,3 +379,80 @@ The index is the 0-based sample index as shown in the converter output (e.g., `S
 | `1101` | Noise mode ON |
 | `1100` | Noise mode OFF |
 | `17xx` | PCM sample mode (not used by this converter) |
+
+## FamiTracker (.ftm) Support
+
+### Format Overview
+
+FamiTracker `.ftm` files target the NES 2A03 (2 pulse + 1 triangle + 1 noise + 1 DPCM). The converter maps NES channels to PCE wavetable channels and preserves instrument envelope data that would otherwise be lost in a naive conversion.
+
+### SEQUENCES Block Parsing
+
+FTM files store instrument envelopes in a SEQUENCES block. Each sequence has a type and an index:
+
+| Type | ID | Purpose |
+|------|----|---------|
+| Volume | 0 | Amplitude envelope (NES 0–15) |
+| Arpeggio | 1 | Semitone offset pattern |
+| Pitch | 2 | Fine pitch sweep |
+| Hi-Pitch | 3 | Coarse pitch sweep |
+| Duty | 4 | Pulse width (NES-specific, ignored) |
+
+The converter supports SEQUENCES block versions 1–6. Older versions (≤2) use the **COldSequence** pair format: each step is a `(value, length)` byte pair where `length ≥ 0` means repeat `value` for `length+1` frames, and `length < 0` means loop back `|length|` items. Newer versions (3+) store flat value arrays with explicit loop/release point indices.
+
+### Envelope Conversion
+
+**Volume envelopes**: NES volume (0–15) is scaled to PCE volume (0–31) by multiplying by 2, capped at 31. Loop points are preserved as Furnace macro loops.
+
+**Arpeggio envelopes**: Signed semitone offsets are passed through directly to Furnace arpeggio macros (macro code 1 in INS2 format). Loop points are preserved.
+
+Pitch, Hi-Pitch, and Duty sequences are currently parsed but not mapped to Furnace macros.
+
+### Instrument → Sequence Binding
+
+Each FTM instrument stores 5 `(enabled, seq_index)` pairs — one per sequence type. During conversion, the parser resolves these references and attaches the expanded envelope data to each `ModSample`. The downstream pipeline reads `ftm_volume_env`, `ftm_arp_env`, and their loop/release indices to override the default flat macros.
+
+### Tempo Mapping
+
+FamiTracker's "Tempo" value is **not** BPM. The actual BPM is:
+
+$$\text{BPM} = \frac{60 \times \text{Tempo} \times 6}{150 \times \text{Speed}}$$
+
+For example, Tempo=150 with Speed=7 yields BPM ≈ 128.57. The converter stores the raw Speed value and frame rate (60 Hz for NTSC) in the Furnace file, letting Furnace compute the correct playback rate. A Furnace display of "128 BPM" for FT Tempo=150 / Speed=7 is correct.
+
+### Debugging FTM Conversions
+
+When an FTM conversion sounds wrong, check:
+
+1. **"FTM volume envelopes applied to N instruments"** — confirms envelope extraction worked. If N=0, the SEQUENCES block may be missing or all instruments have envelopes disabled.
+2. **Arpeggio values** — open the `.fur` in Furnace, inspect the instrument macro tab. Arpeggio values should match FamiTracker's sequence editor (signed semitone offsets).
+3. **Triangle channel** — NES triangle has no volume control (always full or silent). The converter assigns a flat volume envelope [31]. If the triangle sounds too loud relative to other channels, adjust manually in Furnace.
+4. **Noise instruments** — NES noise channel (ch4) maps to PCE noise channels (5–6) with `1101` noise-enable effects. Verify noise notes landed on the correct channels.
+
+## Regression Tests
+
+The regression suite converts all example files and validates output structure:
+
+```bash
+python tools/regression_test.py           # run all tests
+python tools/regression_test.py --keep    # keep temp .fur files for inspection
+```
+
+Each example directory under `examples/` must have a `convert.bat` whose `python convert_mod.py ...` line is parsed for the source file and CLI flags. The test runner:
+
+1. Parses `convert.bat` for source file and flags
+2. Runs the conversion to a temporary `.fur` file
+3. Validates the output with `tools/verify_fur.py`
+4. Reports PASS/FAIL/SKIP per example
+
+**Current test coverage** (5 examples):
+
+| Example | Format | Key Features Tested |
+|---------|--------|---------------------|
+| TinyTune | MOD | Basic conversion, noise instruments, arpeggio cloning |
+| LittleSwedishGirl | XM | 9-channel drop, arpeggio patterns |
+| SatteliteOne | S3M | Channel drop + merge |
+| SecondReality | S3M | Large instrument set (54 → 31 used) |
+| FamiTracker_EnhantedLands | FTM | Volume + arpeggio envelope extraction |
+
+Run the suite after any converter changes to catch regressions.
